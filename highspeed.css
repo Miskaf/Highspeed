@@ -523,3 +523,43 @@ tbody tr:hover{background:#F8FAFC;}
 .debt-table tr.row-over td{background:#FFF8F8;}
 .debt-table td.actions .btn{margin-right:4px;}
 @media(max-width:640px){ .dh-fig{text-align:left;} .debt-head{gap:10px;} }
+
+/* ===== Debts we owe (payables) ===== */
+.tag-overdue{background:var(--red-050);color:#B23336;}
+.tag-part{background:var(--cyan-050);color:#0E8A96;}
+.tag-cat{background:#EEF1F6;color:var(--text-600);}
+.alert-bar{display:flex;align-items:center;gap:12px;background:var(--red-050);color:#8E2427;border:1px solid #F5C7C8;border-radius:14px;padding:12px 16px;margin-bottom:16px;cursor:pointer;font-size:13.5px;transition:.15s;}
+.alert-bar:hover{box-shadow:var(--shadow-md);transform:translateY(-1px);}
+.alert-bar div{flex:1;}
+.ab-ic{display:flex;color:#B23336;}
+.ab-go{font-weight:800;font-size:12.5px;display:flex;align-items:center;gap:2px;}
+.pay-card{margin-bottom:14px;border-left:5px solid var(--amber-500);}
+.pay-card.overdue{border-left-color:var(--red-500);}
+.pay-card.paid{border-left-color:var(--green-500);opacity:.85;}
+.pay-card.part{border-left-color:var(--cyan-500);}
+.pc-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;}
+.pc-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:15px;}
+.pc-bal{text-align:right;}
+.pc-bal small{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-400);font-weight:700;}
+.pc-bal span{font-family:var(--mono);font-weight:800;font-size:21px;}
+.pc-bal .owing{color:#B23336;}
+.pc-desc{font-size:13px;margin:4px 0 12px;}
+.prog{height:9px;border-radius:6px;background:var(--bg);overflow:hidden;margin-bottom:12px;}
+.prog-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,var(--cyan-500),var(--cyan-400));transition:width .5s ease;}
+.prog-fill.paid{background:linear-gradient(90deg,var(--green-500),#6EDDB0);}
+.prog-fill.overdue{background:linear-gradient(90deg,var(--red-500),#F59A9C);}
+.pc-nums{display:flex;flex-wrap:wrap;gap:6px 22px;font-size:12.5px;color:var(--text-600);}
+.pc-nums b{font-family:var(--mono);color:var(--text-900);}
+.pc-nums b.pos{color:#1B8A5A;} .pc-nums b.owing{color:#B23336;}
+.pc-nums em{font-style:normal;color:var(--text-400);}
+.pc-nums em.bad{color:#B23336;font-weight:700;}
+.pc-note{margin-top:10px;font-size:12.5px;color:var(--text-600);background:#F8FAFC;border-radius:8px;padding:8px 10px;}
+.pay-hist{margin-top:12px;border-top:1px dashed var(--border);padding-top:8px;}
+.ph-title{font-size:11px;text-transform:uppercase;letter-spacing:.6px;font-weight:800;color:var(--text-400);margin-bottom:4px;}
+.ph-row{display:grid;grid-template-columns:70px 100px 1fr auto;gap:10px;align-items:center;font-size:12.5px;padding:4px 0;}
+.ph-amt{font-family:var(--mono);font-weight:700;color:#1B8A5A;}
+.ph-row em{font-style:normal;color:#0E8A96;}
+.pc-actions{margin-top:14px;}
+.chk{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--text-900);margin-bottom:10px;}
+.chk input{width:auto;}
+@media(max-width:640px){ .ph-row{grid-template-columns:60px 90px 1fr auto;} .pc-head{flex-direction:column;} .pc-bal{text-align:left;} }
