@@ -119,6 +119,7 @@ let stations   = loadData("stations", null) || DEFAULT_STATIONS;
 let inventory  = loadData("inventory", null) || DEFAULT_INVENTORY;
 let staff      = loadData("staff", null) || DEFAULT_STAFF;
 let closings   = loadData("closings", []);
+let debts      = loadData("debts", []);   // manually recorded debts (cash lent, goods, old balances…)
 const DEFAULT_SHARES = () => ([
   {id:uid(), name:"Shop Maintenance Fund", kind:"fund",   pct:20},
   {id:uid(), name:"Owner",                 kind:"person", pct:40},
@@ -138,6 +139,7 @@ function persistAll(){
   saveData("inventory", inventory);
   saveData("staff", staff);
   saveData("closings", closings);
+  saveData("debts", debts);
   saveData("profitshare", profitShare);
 }
 persistAll();
@@ -271,6 +273,11 @@ function attachCloudListeners(){
     saveData('closings', closings);
     safeRerender();
   }));
+  CLOUD_LISTENERS.push(fsCol('debts').onSnapshot(snap=>{
+    debts = snap.docs.map(d=>d.data());
+    saveData('debts', debts);
+    safeRerender();
+  }));
   CLOUD_LISTENERS.push(psDoc().onSnapshot(doc=>{
     if(doc.exists){
       const d = doc.data();
@@ -368,7 +375,7 @@ function renderNav(){
     ${items.map(it=>{
       let badge='';
       if(it.id==='inventory' && lowStockCount()>0) badge=`<span class="badge">${lowStockCount()}</span>`;
-      if(it.id==='debts' && owingSales().length>0) badge=`<span class="badge">${owingSales().length}</span>`;
+      if(it.id==='debts'){ const od=openDebts(); if(od.length>0) badge=`<span class="badge">${od.length}</span>`; }
       return `
       <button class="navitem ${currentPage===it.id?'active':''}" onclick="go('${it.id}')">
         <span class="ic">${icon(it.ic,17)}</span><span>${it.label}</span>${badge}
@@ -433,23 +440,74 @@ function renderPage(){
   if(currentPage==='pos') initPOSForm();
   if(currentPage==='reports') initReports();
   if(currentPage==='sales') filterSalesLog();
+  if(currentPage==='debts') debtBind();
   if(currentPage==='closing'){ const f=closingFigures(isAdmin()?(closeDate||todayISO()):todayISO(), currentStaff?currentStaff.name:''); initClosingLive(f.expected); }
   if(currentPage==='stations') renderStationGrid();
   if(currentPage==='settings'){ renderStaffList(); renderCloudPanel(); }
 }
 
 /* ---------------- Helpers on data ---------------- */
-function isCounted(s){ return s.payment!=='credit' || s.paid===true; }
-function effDate(s){ return s.payment==='credit' ? (s.paidDate||s.date) : s.date; }
+const DEBT_CATEGORIES = ['Browsing','Printing / Copying','Typing & Documents','Forms & Registration','Recharge / POS','Cash lent','Goods / items','Other'];
+function guessDebtCategory(sale){
+  const svc = services.find(x=>x.name===sale.service);
+  const c = ((svc && svc.category)||'').toLowerCase(), n=(sale.service||'').toLowerCase();
+  if(n.startsWith('browsing') || c==='browsing') return 'Browsing';
+  if(['printing','photocopy','scanning','lamination','binding'].includes(c)) return 'Printing / Copying';
+  if(c==='typing') return 'Typing & Documents';
+  if(c==='forms') return 'Forms & Registration';
+  if(c==='recharge' || c==='pos') return 'Recharge / POS';
+  return 'Other';
+}
+function isCredit(x){ return x.payment==='credit'; }
+/* payments received against a credit sale (older records used paid/paidDate) */
+function payListOf(x){
+  if(!isCredit(x)) return [];
+  if(Array.isArray(x.payments)) return x.payments;
+  if(x.paid) return [{id:'legacy', date:x.paidDate||x.date, amount:Number(x.amount), method:x.paidMethod||'cash', by:x.paidBy||'', ts:0, note:''}];
+  return [];
+}
+function paidOf(x){ return sum(payListOf(x),'amount'); }
+function outstandingOf(x){ if(!isCredit(x) || x.writtenOff) return 0; return Math.max(0, Number(x.amount)-paidOf(x)); }
+function receivedOf(x){ return isCredit(x) ? paidOf(x) : Number(x.amount); }
+
 /* Revenue view: money actually received (credit sales count once they are paid) */
+/* Revenue view (cash basis): normal sales on their date, and every payment on a credit sale on the day it was received */
+function revenueRecords(){
+  const out=[];
+  sales.forEach(x=>{
+    if(!isCredit(x)) out.push(x);
+    else payListOf(x).forEach(p=>out.push({...x, amount:Number(p.amount), date:p.date, paidMethod:p.method}));
+  });
+  return out;
+}
 function salesBetween(startISO, endISO){
-  return sales.filter(s=> isCounted(s) && effDate(s)>=startISO && effDate(s)<=endISO);
+  return revenueRecords().filter(x=> x.date>=startISO && x.date<=endISO);
 }
 /* Log view: every sale by the day it was made */
 function allSalesBetween(startISO, endISO){
   return sales.filter(s=> s.date>=startISO && s.date<=endISO);
 }
-function owingSales(){ return sales.filter(s=>s.payment==='credit' && !s.paid); }
+/* One list of everything owed to the shop: credit sales + manually recorded debts */
+function debtItems(){
+  const items=[];
+  sales.filter(isCredit).forEach(x=>items.push({
+    kind:'sale', id:x.id, customer:x.customer||'Unknown', phone:x.phone||'', category:x.debtCategory||guessDebtCategory(x),
+    desc:x.service+(x.qty>1?' ×'+x.qty:''), total:Number(x.amount), date:x.date, ts:x.ts||0, due:x.dueDate||'',
+    payments:payListOf(x), writtenOff:!!x.writtenOff, staff:x.staff||'', receipt:x.receipt||'', note:x.note||'', src:x }));
+  debts.forEach(d=>items.push({
+    kind:'manual', id:d.id, customer:d.customer||'Unknown', phone:d.phone||'', category:d.category||'Other',
+    desc:d.description||d.category||'Debt', total:Number(d.amount), date:d.date, ts:d.ts||0, due:d.dueDate||'',
+    payments:Array.isArray(d.payments)?d.payments:[], writtenOff:!!d.writtenOff, staff:d.staff||'', receipt:'', note:d.note||'', src:d }));
+  const today=todayISO();
+  items.forEach(it=>{
+    it.paid=sum(it.payments,'amount');
+    it.balance=it.writtenOff?0:Math.max(0,Math.round((it.total-it.paid)*100)/100);
+    it.status=it.writtenOff?'writtenoff':(it.balance<=0?'cleared':(it.paid>0?'part':'unpaid'));
+    it.overdue=it.balance>0 && !!it.due && it.due<today;
+  });
+  return items;
+}
+function openDebts(){ return debtItems().filter(i=>i.balance>0); }
 function hourOf(s){
   if(s.hour!=null) return Number(s.hour);
   const m = /(\d{1,2}):(\d{2})\s*(AM|PM)?/i.exec(s.time||'');
@@ -503,7 +561,7 @@ function pageDashboard(){
   const exp = sum(todayExp,'amount');
   const profit = revenue - exp;
   const activeStations = stations.filter(s=>s.status==='active').length;
-  const owing = owingSales();
+  const owing = openDebts();
   const tsOf = x => x.ts || parseISO(x.date).getTime();
   const recent = [...sales].sort((a,b)=> tsOf(b)-tsOf(a)).slice(0,8);
   const usage = serviceUsage();
@@ -535,7 +593,7 @@ function pageDashboard(){
     ${statCard('accent-cyan','trend',"Today's Revenue",fmt(revenue),`${todaySales.length} payment${todaySales.length===1?'':'s'} received`)}
     ${statCard('accent-red','wallet',"Today's Expenses",fmt(exp),`${todayExp.length} entr${todayExp.length===1?'y':'ies'}`)}
     ${statCard('accent-green','coins','Net Profit Today',fmt(profit),'Revenue minus expenses',`color:${profit>=0?'#1B8A5A':'#B23336'}`)}
-    ${statCard('accent-amber','monitor','Active Stations',`${activeStations}<span class="of"> / ${stations.length}</span>`, owing.length ? `<span class="lowstock">${fmt(sum(owing,'amount'))} owed by customers</span>` : (lowStockCount()>0 ? `<span class="lowstock">${lowStockCount()} item(s) low on stock</span>` : 'All clear'))}
+    ${statCard('accent-amber','monitor','Active Stations',`${activeStations}<span class="of"> / ${stations.length}</span>`, owing.length ? `<span class="lowstock">${fmt(sum(owing,'balance'))} owed by customers</span>` : (lowStockCount()>0 ? `<span class="lowstock">${lowStockCount()} item(s) low on stock</span>` : 'All clear'))}
   </div>
 
   ${isAdmin() ? `<div class="section-title">Growth</div>${trendsHTML()}` : ''}
@@ -572,14 +630,20 @@ function pageDashboard(){
             <td>${esc(x.service)}${x.qty>1?` ×${esc(x.qty)}`:''}</td>
             <td class="muted">${esc(x.customer||'—')}</td>
             <td>${payTag(x)}</td>
-            <td style="text-align:right;" class="amt ${isCounted(x)?'pos':'owing'}">${fmt(x.amount)}</td>
+            <td style="text-align:right;" class="amt ${outstandingOf(x)>0?'owing':'pos'}">${fmt(x.amount)}</td>
           </tr>`).join('') : `<tr class="empty-row"><td colspan="5">No sales recorded yet. Start with New Sale or Quick Sale above.</td></tr>`}
       </tbody>
     </table>
   </div>`;
 }
 function payTag(x){
-  if(x.payment==='credit') return x.paid ? '<span class="tag tag-paidlater">paid later</span>' : '<span class="tag tag-credit">owing</span>';
+  if(isCredit(x)){
+    if(x.writtenOff) return '<span class="tag tag-wo">written off</span>';
+    const p=paidOf(x);
+    if(p>=Number(x.amount)) return '<span class="tag tag-paidlater">paid later</span>';
+    if(p>0) return '<span class="tag tag-part">part paid</span>';
+    return '<span class="tag tag-credit">owing</span>';
+  }
   return `<span class="tag tag-${esc(x.payment)}">${esc(x.payment)}</span>`;
 }
 function payOptions(sel){
@@ -592,7 +656,7 @@ function copyDailySummary(){
   const pay={}; ts.forEach(x=>{ const m = x.payment==='credit' ? (x.paidMethod||'cash') : x.payment; pay[m]=(pay[m]||0)+Number(x.amount); });
   const bySvc={}; ts.forEach(x=>{ bySvc[x.service]=(bySvc[x.service]||0)+Number(x.amount); });
   const top=Object.entries(bySvc).sort((a,b)=>b[1]-a[1]).slice(0,3);
-  const owed=sum(owingSales(),'amount');
+  const owed=sum(openDebts(),'balance');
   const lines=[
     `*${settings.shopName}* — daily summary`,
     new Date().toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long',year:'numeric'}),
@@ -647,7 +711,7 @@ function confirmQuickSale(serviceId){
 /* ================= NEW SALE (POS) ================= */
 let posSel = localStorage.getItem('hs_posSel') || null;
 let posCart = [];
-let posForm = {qty:1, price:0, amount:0, customer:'', payment:'cash', note:''};
+let posForm = {qty:1, price:0, amount:0, customer:'', payment:'cash', note:'', phone:'', dcat:'', due:'', deposit:'', depMethod:'cash'};
 let posHi = -1, posList = [];
 
 function pagePOS(){
@@ -672,6 +736,18 @@ function pagePOS(){
       <div class="row">
         <div class="field"><label>Customer name <span class="lab-hint">(required if owing)</span></label><input type="text" id="posCustomer" placeholder="Walk-in"></div>
         <div class="field"><label>Payment</label><select id="posPayment">${payOptions('cash')}</select></div>
+      </div>
+      <div class="credit-box" id="posCreditBox" style="display:none;">
+        <div class="cb-title">${icon('clock',15)} Owing details</div>
+        <div class="row">
+          <div class="field"><label>Customer phone <span class="lab-hint">(optional)</span></label><input type="tel" id="posPhone" placeholder="0803…"></div>
+          <div class="field"><label>Category</label><select id="posDcat"><option value="">Auto (from the service)</option>${DEBT_CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select></div>
+        </div>
+        <div class="row3">
+          <div class="field"><label>Pay-by date</label><input type="date" id="posDue"></div>
+          <div class="field"><label>Paid now (deposit)</label><input type="number" id="posDeposit" min="0" step="any" placeholder="0"></div>
+          <div class="field"><label>Deposit via</label><select id="posDepMethod"><option value="cash">Cash</option><option value="transfer">Transfer</option><option value="pos">POS</option></select></div>
+        </div>
       </div>
       <div class="field"><label>Note (optional)</label><input type="text" id="posNote" placeholder="e.g. 2-page CV, blue folder"></div>
       <div class="btn-row"><button class="btn btn-primary" id="posSaveBtn">Save sale</button><button class="btn btn-cyan" id="posSavePrintBtn">${icon('print',16)} Save &amp; print receipt</button></div>
@@ -771,7 +847,11 @@ function initPOSForm(){
   $('posAmount').addEventListener('input',e=>{ posForm.amount=e.target.value; });
   [$('posQty'),$('posPrice'),$('posAmount')].forEach(el=>el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); posAddLine(); } }));
   $('posCustomer').addEventListener('input',e=>{ posForm.customer=e.target.value; });
-  $('posPayment').addEventListener('change',e=>{ posForm.payment=e.target.value; });
+  $('posPayment').addEventListener('change',e=>{ posForm.payment=e.target.value; posToggleCredit(); });
+  [['posPhone','phone'],['posDcat','dcat'],['posDue','due'],['posDeposit','deposit'],['posDepMethod','depMethod']].forEach(([id,k])=>{
+    const el=$(id); el.value=posForm[k]; el.addEventListener(id==='posDcat'||id==='posDepMethod'?'change':'input',e=>{ posForm[k]=e.target.value; });
+  });
+  posToggleCredit();
   $('posNote').addEventListener('input',e=>{ posForm.note=e.target.value; });
   $('posAddBtn').addEventListener('click',posAddLine);
   $('posSaveBtn').addEventListener('click',()=>posSave(false));
@@ -785,22 +865,34 @@ function renderPosTodayList(){
   const el=document.getElementById('posTodayList'); if(!el) return;
   el.innerHTML = list.length ? `
     <table><thead><tr><th>Time</th><th>Service</th><th style="text-align:right;">Amt</th></tr></thead>
-    <tbody>${list.map(x=>`<tr><td class="muted">${esc(x.time)}</td><td>${esc(x.service)}${x.qty>1?' ×'+esc(x.qty):''} ${x.payment==='credit'&&!x.paid?'<span class="tag tag-credit">owing</span>':''}</td><td style="text-align:right;" class="amt ${isCounted(x)?'pos':'owing'}">${fmt(x.amount)}</td></tr>`).join('')}</tbody></table>
+    <tbody>${list.map(x=>`<tr><td class="muted">${esc(x.time)}</td><td>${esc(x.service)}${x.qty>1?' ×'+esc(x.qty):''} ${isCredit(x)?payTag(x):''}</td><td style="text-align:right;" class="amt ${outstandingOf(x)>0?'owing':'pos'}">${fmt(x.amount)}</td></tr>`).join('')}</tbody></table>
     <div class="today-total">Received today: ${fmt(sum(salesBetween(t,t),'amount'))}</div>
   ` : `<div class="muted" style="font-size:13px;">No sales yet today.</div>`;
 }
+function posToggleCredit(){ const b=document.getElementById('posCreditBox'); if(b) b.style.display = posForm.payment==='credit' ? 'block' : 'none'; }
 function posSave(print){
   if(!posCart.length){ if(!posAddLine()) return; }
   const customer=(posForm.customer||'').trim(), payment=posForm.payment, note=(posForm.note||'').trim();
   if(payment==='credit' && !customer){ toast("Enter the customer's name for an owing sale"); const c=document.getElementById('posCustomer'); if(c) c.focus(); return; }
+  const totalDue=sum(posCart,'amount');
+  let deposit=Number(posForm.deposit)||0;
+  if(deposit<0) deposit=0;
+  if(payment==='credit' && deposit>totalDue){ toast('Deposit is more than the total'); return; }
   const receipt='R'+uid().slice(-6).toUpperCase();
-  const recs=posCart.map(l=>addSale({serviceId:l.serviceId, service:l.name, qty:l.qty, unitPrice:l.unitPrice, amount:l.amount, customer, payment, note, receipt}));
+  const dcat = posForm.dcat || (payment==='credit' ? guessDebtCategory({service:posCart[0].name}) : '');
+  let remaining=deposit;
+  const recs=posCart.map(l=>{
+    let dep=0; if(payment==='credit' && remaining>0){ dep=Math.min(remaining,l.amount); remaining-=dep; }
+    return addSale({serviceId:l.serviceId, service:l.name, qty:l.qty, unitPrice:l.unitPrice, amount:l.amount, customer, payment, note, receipt,
+      phone:posForm.phone, debtCategory:dcat, dueDate:posForm.due, deposit:dep, depositMethod:posForm.depMethod});
+  });
   const total=sum(recs,'amount');
-  posCart=[]; posForm.customer=''; posForm.note=''; posForm.payment='cash';
+  posCart=[]; posForm.customer=''; posForm.note=''; posForm.payment='cash'; posForm.phone=''; posForm.dcat=''; posForm.due=''; posForm.deposit=''; posForm.depMethod='cash';
   const $=x=>document.getElementById(x);
-  $('posCustomer').value=''; $('posNote').value=''; $('posPayment').value='cash';
+  ['posCustomer','posNote','posPhone','posDue','posDeposit'].forEach(i=>{ if($(i)) $(i).value=''; });
+  $('posPayment').value='cash'; $('posDcat').value=''; $('posDepMethod').value='cash'; posToggleCredit();
   renderCart(); renderPosTodayList();
-  toast((payment==='credit'?'Owing sale saved: ':'Sale saved: ')+fmt(total));
+  toast(payment==='credit' ? `Owing sale saved: ${fmt(total)}${deposit>0?' · '+fmt(deposit)+' paid now':''}` : 'Sale saved: '+fmt(total));
   if(print) printReceipt(recs);
 }
 function addSale(data){
@@ -813,7 +905,10 @@ function addSale(data){
     staff: currentStaff ? currentStaff.name : '',
     receipt: data.receipt || ('R'+uid().slice(-6).toUpperCase())
   };
-  if(rec.payment==='credit') rec.paid=false;
+  if(rec.payment==='credit'){
+    rec.payments=[]; rec.phone=data.phone||''; rec.debtCategory=data.debtCategory||''; rec.dueDate=data.dueDate||'';
+    if(Number(data.deposit)>0) rec.payments.push({id:uid(), date:todayISO(), amount:Math.min(Number(data.deposit),Number(rec.amount)), method:data.depositMethod||'cash', by:rec.staff, ts:rec.ts, note:'Paid at time of sale'});
+  }
   const svc = data.serviceId ? services.find(x=>x.id===data.serviceId) : null;
   if(svc && svc.stockItemId && Number(svc.stockPer)>0){
     const item = inventory.find(i=>i.id===svc.stockItemId);
@@ -989,7 +1084,7 @@ function slFiltered(){
   const q=slState.q.trim().toLowerCase();
   const tsOf=x=>x.ts||0;
   return allSalesBetween(slState.from,slState.to)
-    .filter(x=> slState.status==='all' || (slState.status==='owing' ? (x.payment==='credit'&&!x.paid) : isCounted(x)))
+    .filter(x=> slState.status==='all' || (slState.status==='owing' ? outstandingOf(x)>0 : !(outstandingOf(x)>0)))
     .filter(x=> !q || [x.service,x.customer,x.staff,x.note,x.receipt,x.payment].join(' ').toLowerCase().includes(q))
     .sort((a,b)=> tsOf(b)-tsOf(a) || (b.date+b.time<a.date+a.time?-1:1));
 }
@@ -1000,8 +1095,8 @@ function filterSalesLog(){
   const $=id=>document.getElementById(id);
   if($('slFrom')){ slState.from=$('slFrom').value||slState.from; slState.to=$('slTo').value||slState.to; slState.q=$('slSearch').value; slState.status=$('slStatus').value; }
   const rows=slFiltered();
-  const received=sum(rows.filter(isCounted),'amount');
-  const owingAmt=sum(rows.filter(x=>!isCounted(x)),'amount');
+  const received=sum(rows.map(x=>({v:receivedOf(x)})),'v');
+  const owingAmt=sum(rows.map(x=>({v:outstandingOf(x)})),'v');
   const el=$('salesLogTable'); if(!el) return;
   el.innerHTML = `
     <thead><tr><th>Date</th><th>Time</th><th>Service</th><th>Customer</th><th>Staff</th><th>Pay</th><th style="text-align:right;">Amount</th><th></th></tr></thead>
@@ -1013,7 +1108,7 @@ function filterSalesLog(){
         <td>${esc(x.customer||'—')}</td>
         <td class="muted">${esc(x.staff||'—')}</td>
         <td>${payTag(x)}</td>
-        <td style="text-align:right;" class="amt ${isCounted(x)?'pos':'owing'}">${fmt(x.amount)}</td>
+        <td style="text-align:right;" class="amt ${outstandingOf(x)>0?'owing':'pos'}">${fmt(x.amount)}</td>
         <td class="actions">${isAdmin() ? `<button class="icon-btn" title="Edit" onclick="editSale('${x.id}')">${icon('edit',15)}</button><button class="icon-btn danger" title="Delete" onclick="deleteSale('${x.id}')">${icon('trash',15)}</button>` : ''}</td>
       </tr>`).join('') : `<tr class="empty-row"><td colspan="8">No sales match.</td></tr>`}
     </tbody>
@@ -1058,8 +1153,8 @@ function saveSaleEdit(id){
   }
   x.service=$('esService').value.trim()||x.service; x.qty=newQty||x.qty; x.unitPrice=Number($('esPrice').value)||0; x.amount=newAmt;
   x.customer=cust; x.note=$('esNote').value.trim();
-  if(pay==='credit'){ if(x.payment!=='credit'){ x.paid=false; } }
-  else { delete x.paid; delete x.paidDate; delete x.paidMethod; delete x.paidBy; }
+  if(pay==='credit'){ if(x.payment!=='credit'){ x.payments=[]; x.phone=x.phone||''; x.debtCategory=''; x.dueDate=''; delete x.paid; } }
+  else { delete x.paid; delete x.paidDate; delete x.paidMethod; delete x.paidBy; delete x.payments; delete x.phone; delete x.debtCategory; delete x.dueDate; delete x.writtenOff; }
   x.payment=pay;
   saveData('sales',sales); cloudSet('sales',x);
   closeModal(); toast('Sale updated'); renderPage();
@@ -1077,8 +1172,8 @@ function deleteSale(id){
 
 
 function exportSalesCSV(){
-  const rows=slFiltered().map(x=>({...x, status: x.payment==='credit' ? (x.paid?'paid later':'owing') : 'paid'}));
-  downloadCSV(rows, ['date','time','receipt','service','qty','unitPrice','amount','customer','staff','payment','status','paidDate','note'], 'highspeed-sales-'+slState.from+'_to_'+slState.to+'.csv');
+  const rows=slFiltered().map(x=>({...x, received:receivedOf(x), balance:outstandingOf(x), status: isCredit(x) ? (x.writtenOff?'written off':(paidOf(x)>=Number(x.amount)?'paid later':(paidOf(x)>0?'part paid':'owing'))) : 'paid'}));
+  downloadCSV(rows, ['date','time','receipt','service','qty','unitPrice','amount','received','balance','customer','staff','payment','status','note'], 'highspeed-sales-'+slState.from+'_to_'+slState.to+'.csv');
 }
 function downloadCSV(rows, cols, filename){
   const header = cols.join(',');
@@ -1092,45 +1187,264 @@ function downloadCSV(rows, cols, filename){
 document.addEventListener('DOMContentLoaded', ()=>{});
 
 /* ================= CUSTOMER DEBTS ================= */
-function pageDebts(){
-  const owing = owingSales();
-  const groups = {};
-  owing.forEach(x=>{ const k=(x.customer||'Unknown').trim().toLowerCase(); (groups[k]=groups[k]||{name:x.customer||'Unknown',lines:[]}).lines.push(x); });
-  const list = Object.values(groups).sort((a,b)=>sum(b.lines,'amount')-sum(a.lines,'amount'));
-  const paidRecent = sales.filter(x=>x.payment==='credit' && x.paid).sort((a,b)=>(b.paidDate||'').localeCompare(a.paidDate||'')).slice(0,10);
-  return `
-  <div class="grid grid-3">
-    ${statCard('accent-amber','clock','Total owed',fmt(sum(owing,'amount')),`${owing.length} unpaid item${owing.length===1?'':'s'}`)}
-    ${statCard('accent-cyan','users','Customers owing',String(list.length),'Unpaid balances')}
-    ${statCard('accent-green','check','Collected this week',fmt(sum(sales.filter(x=>x.payment==='credit'&&x.paid&&x.paidDate>=weekStartOf(todayISO())),'amount')),'Debts paid since Monday')}
-  </div>
-  <div class="section-title">Who owes the shop <span class="hint">Record a sale as “Owing” in New Sale</span></div>
-  ${list.length ? list.map(g=>`
-    <div class="card debt-card">
-      <div class="debt-head"><div><div class="debt-name">${esc(g.name)}</div><div class="muted">${g.lines.length} item${g.lines.length===1?'':'s'}</div></div>
-        <div class="debt-total">${fmt(sum(g.lines,'amount'))}</div>
-        <button class="btn btn-cyan btn-sm" onclick="payDebtModal('${g.lines.map(l=>l.id).join(',')}')">Paid everything</button></div>
-      ${g.lines.map(l=>`<div class="debt-line"><span class="muted">${esc(l.date)}</span><span class="dl-s">${esc(l.service)}${l.qty>1?' ×'+esc(l.qty):''}</span><b>${fmt(l.amount)}</b><button class="btn btn-sm" onclick="payDebtModal('${l.id}')">Mark paid</button></div>`).join('')}
-    </div>`).join('') : '<div class="card empty-card">Nobody owes you anything right now. 🎉</div>'}
-  ${paidRecent.length?`<div class="section-title">Recently collected</div><div class="card table-wrap"><table><thead><tr><th>Paid on</th><th>Customer</th><th>Service</th><th>Received by</th><th style="text-align:right;">Amount</th></tr></thead><tbody>${paidRecent.map(x=>`<tr><td>${esc(x.paidDate)}</td><td>${esc(x.customer)}</td><td>${esc(x.service)}</td><td class="muted">${esc(x.paidBy||'—')} · ${esc(x.paidMethod||'')}</td><td style="text-align:right;" class="amt pos">${fmt(x.amount)}</td></tr>`).join('')}</tbody></table></div>`:''}`;
+
+
+
+
+/* ================= CUSTOMER DEBTS (ledger) ================= */
+let dbState = {q:'', status:'active', cat:'all'};
+const DEBT_STATUS_LABEL = {unpaid:['owing','tag-credit'], part:['part paid','tag-part'], cleared:['cleared','tag-paidlater'], writtenoff:['written off','tag-wo']};
+function debtKey(it){ return (it.customer||'unknown').trim().toLowerCase(); }
+function debtSrc(kind,id){ return kind==='sale' ? sales.find(x=>x.id===id) : debts.find(x=>x.id===id); }
+function debtSave(kind,src){ if(kind==='sale'){ saveData('sales',sales); cloudSet('sales',src); } else { saveData('debts',debts); cloudSet('debts',src); } }
+function debtEnsurePayments(kind,src){
+  if(kind==='sale' && !Array.isArray(src.payments)){
+    src.payments = payListOf(src).map(p=>({...p}));
+    delete src.paid; delete src.paidDate; delete src.paidMethod; delete src.paidBy;
+  }
+  if(kind==='manual' && !Array.isArray(src.payments)) src.payments=[];
 }
-function payDebtModal(ids){
-  const items = ids.split(',').map(i=>sales.find(x=>x.id===i)).filter(Boolean);
-  if(!items.length) return;
-  openModal(`
-    <h2>Collect payment</h2>
-    <div class="sub">${esc(items[0].customer)} · ${items.length} item${items.length===1?'':'s'} · <b>${fmt(sum(items,'amount'))}</b></div>
-    <div class="field"><label>How did they pay?</label><select id="pdMethod"><option value="cash">Cash</option><option value="transfer">Transfer</option><option value="pos">POS</option></select></div>
-    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="confirmPayDebt('${ids}')">Confirm payment</button></div>`);
+function debtAddPayment(kind,id,amount,method,note){
+  const src=debtSrc(kind,id); if(!src) return false;
+  debtEnsurePayments(kind,src);
+  src.payments.push({id:uid(), date:todayISO(), amount:Math.round(amount*100)/100, method, by:currentStaff?currentStaff.name:'', ts:Date.now(), note:note||''});
+  debtSave(kind,src); return true;
 }
-function confirmPayDebt(ids){
-  const method=document.getElementById('pdMethod').value;
-  ids.split(',').forEach(i=>{
-    const x=sales.find(r=>r.id===i); if(!x) return;
-    x.paid=true; x.paidDate=todayISO(); x.paidMethod=method; x.paidBy=currentStaff?currentStaff.name:'';
-    cloudSet('sales',x);
+function debtFiltered(){
+  const q=dbState.q.trim().toLowerCase();
+  return debtItems().filter(it=>{
+    if(dbState.status==='active' && !(it.balance>0)) return false;
+    if(dbState.status==='overdue' && !it.overdue) return false;
+    if(dbState.status==='part' && it.status!=='part') return false;
+    if(dbState.status==='cleared' && it.status!=='cleared') return false;
+    if(dbState.status==='writtenoff' && it.status!=='writtenoff') return false;
+    if(dbState.cat!=='all' && it.category!==dbState.cat) return false;
+    if(q && ![it.customer,it.phone,it.desc,it.category,it.note,it.receipt,it.staff].join(' ').toLowerCase().includes(q)) return false;
+    return true;
   });
-  saveData('sales',sales); closeModal(); toast('Payment recorded'); renderNav(); renderPage();
+}
+function debtStatusTag(it){
+  if(it.overdue) return '<span class="tag tag-overdue">overdue</span>';
+  const [l,c]=DEBT_STATUS_LABEL[it.status]; return `<span class="tag ${c}">${l}</span>`;
+}
+function pageDebts(){
+  const all=debtItems(), active=all.filter(i=>i.balance>0), over=active.filter(i=>i.overdue);
+  const wk=weekStartOf(todayISO());
+  const collectedWeek=sum(all.flatMap(i=>i.payments).filter(p=>p.date>=wk),'amount');
+  const customers=new Set(active.map(debtKey)).size;
+  return `
+  <div class="grid grid-4">
+    ${statCard('accent-amber','clock','Total still owed',fmt(sum(active,'balance')),`${customers} customer${customers===1?'':'s'} · ${active.length} item${active.length===1?'':'s'}`)}
+    ${statCard('accent-red','wallet','Overdue',fmt(sum(over,'balance')),`${over.length} item${over.length===1?'':'s'} past the pay-by date`)}
+    ${statCard('accent-green','check','Collected this week',fmt(collectedWeek),'Payments received since Monday')}
+    ${statCard('accent-cyan','coins','Collected so far',fmt(sum(all,'paid')),'On all debts, all time')}
+  </div>
+
+  <div class="card filters" style="margin-top:16px;">
+    <div class="field grow"><label>Search</label><input type="text" id="dbSearch" value="${esc(dbState.q)}" placeholder="name, phone, what for, note…"></div>
+    <div class="field"><label>Show</label><select id="dbStatus">
+      ${[['active','Still owing'],['overdue','Overdue'],['part','Part paid'],['cleared','Cleared'],['writtenoff','Written off'],['all','Everything']].map(([v,l])=>`<option value="${v}" ${dbState.status===v?'selected':''}>${l}</option>`).join('')}</select></div>
+    <div class="field"><label>Category</label><select id="dbCat"><option value="all">All categories</option>${DEBT_CATEGORIES.map(c=>`<option ${dbState.cat===c?'selected':''}>${c}</option>`).join('')}</select></div>
+    <div class="field"><button class="btn btn-cyan" onclick="addDebtModal()">${icon('plus',15)} Record a debt</button></div>
+    <div class="field"><button class="btn btn-sm" onclick="exportDebtsCSV()">Export CSV</button></div>
+  </div>
+  <div id="debtList"></div>`;
+}
+function renderDebtList(){
+  const el=document.getElementById('debtList'); if(!el) return;
+  const items=debtFiltered();
+  if(!items.length){ el.innerHTML='<div class="card empty-card">Nothing matches. When someone owes the shop, it shows up here. 🎉</div>'; return; }
+  const groups={};
+  items.forEach(it=>{ (groups[debtKey(it)]=groups[debtKey(it)]||{name:it.customer,phone:'',items:[]}).items.push(it); if(it.phone) groups[debtKey(it)].phone=it.phone; });
+  const list=Object.entries(groups).sort((a,b)=>sum(b[1].items,'balance')-sum(a[1].items,'balance'));
+  el.innerHTML=list.map(([key,g])=>{
+    const total=sum(g.items,'total'), paid=sum(g.items,'paid'), bal=sum(g.items,'balance');
+    const pctPaid=total>0?Math.min(100,Math.round(paid/total*100)):0;
+    const anyOver=g.items.some(i=>i.overdue);
+    const sorted=g.items.slice().sort((a,b)=>(a.date+String(a.ts)).localeCompare(b.date+String(b.ts)));
+    return `
+    <div class="card debt-card ${anyOver?'is-overdue':''}">
+      <div class="debt-head">
+        <div class="dh-main"><div class="debt-name">${esc(g.name)} ${g.phone?`<a class="dh-phone" href="tel:${esc(g.phone)}">${esc(g.phone)}</a>`:''}</div>
+          <div class="muted">${g.items.length} item${g.items.length===1?'':'s'} · since ${esc(sorted[0].date)}</div></div>
+        <div class="dh-fig"><small>Total</small><b>${fmt(total)}</b></div>
+        <div class="dh-fig"><small>Paid</small><b class="pos">${fmt(paid)}</b></div>
+        <div class="dh-fig"><small>Balance</small><b class="owing">${fmt(bal)}</b></div>
+        <div class="btn-row">
+          ${bal>0?`<button class="btn btn-cyan btn-sm" onclick="custPayModal('${encodeURIComponent(key)}')">Receive payment</button><button class="btn btn-sm" onclick="remindCustomer('${encodeURIComponent(key)}')">${icon('copy',13)} Reminder</button>`:''}
+        </div>
+      </div>
+      <div class="dbar"><div class="dbar-fill" style="width:${pctPaid}%"></div></div>
+      <div class="table-wrap"><table class="debt-table">
+        <thead><tr><th>Date</th><th>What for</th><th>Pay by</th><th style="text-align:right;">Total</th><th style="text-align:right;">Paid</th><th style="text-align:right;">Balance</th><th>Status</th><th></th></tr></thead>
+        <tbody>${sorted.map(it=>`
+          <tr class="${it.overdue?'row-over':''}">
+            <td>${esc(it.date)}</td>
+            <td><b>${esc(it.desc)}</b><div class="sub-line"><span class="tag tag-cat">${esc(it.category)}</span>${it.kind==='manual'?' <span class="muted">manual entry</span>':''}${it.receipt?' <span class="muted">#'+esc(it.receipt)+'</span>':''}${it.note?' <span class="muted">· '+esc(it.note)+'</span>':''}</div></td>
+            <td>${it.due?esc(it.due):'<span class="muted">—</span>'}</td>
+            <td style="text-align:right;" class="amt">${fmt(it.total)}</td>
+            <td style="text-align:right;" class="amt pos">${fmt(it.paid)}</td>
+            <td style="text-align:right;" class="amt ${it.balance>0?'owing':''}">${fmt(it.balance)}</td>
+            <td>${debtStatusTag(it)}</td>
+            <td class="actions">
+              ${it.balance>0?`<button class="btn btn-sm" onclick="debtPayModal('${it.kind}','${it.id}')">Pay</button>`:''}
+              <button class="icon-btn" title="Payment history" onclick="debtHistoryModal('${it.kind}','${it.id}')">${icon('list',15)}</button>
+              ${isAdmin()?`<button class="icon-btn" title="Edit" onclick="debtEditModal('${it.kind}','${it.id}')">${icon('edit',15)}</button>`:''}
+            </td>
+          </tr>`).join('')}</tbody></table></div>
+    </div>`;
+  }).join('');
+}
+function debtBind(){
+  const $=id=>document.getElementById(id);
+  const upd=()=>{ dbState.q=$('dbSearch').value; dbState.status=$('dbStatus').value; dbState.cat=$('dbCat').value; renderDebtList(); };
+  ['dbSearch'].forEach(id=>$(id).addEventListener('input',upd));
+  ['dbStatus','dbCat'].forEach(id=>$(id).addEventListener('change',upd));
+  renderDebtList();
+}
+function debtMethodOptions(){ return '<option value="cash">Cash</option><option value="transfer">Transfer</option><option value="pos">POS</option>'; }
+function debtPayModal(kind,id){
+  const it=debtItems().find(i=>i.kind===kind && i.id===id); if(!it) return;
+  openModal(`
+    <h2>Receive payment</h2>
+    <div class="sub">${esc(it.customer)} · ${esc(it.desc)}</div>
+    <div class="cl-row"><span>Total</span><b>${fmt(it.total)}</b></div>
+    <div class="cl-row"><span>Already paid</span><b>${fmt(it.paid)}</b></div>
+    <div class="cl-row total"><span>Balance</span><b>${fmt(it.balance)}</b></div>
+    <div class="row3" style="margin-top:14px;">
+      <div class="field"><label>Amount received</label><input type="number" id="dpAmount" value="${it.balance}" min="0" step="any"></div>
+      <div class="field"><label>Paid by</label><select id="dpMethod">${debtMethodOptions()}</select></div>
+      <div class="field"><label>Note</label><input type="text" id="dpNote" placeholder="optional"></div>
+    </div>
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="confirmDebtPay('${kind}','${id}')">Save payment</button></div>`);
+}
+function confirmDebtPay(kind,id){
+  const it=debtItems().find(i=>i.kind===kind && i.id===id); if(!it) return;
+  const amt=Number(document.getElementById('dpAmount').value)||0;
+  if(amt<=0){ toast('Enter the amount received'); return; }
+  if(amt>it.balance+0.001){ toast('That is more than the balance ('+fmt(it.balance)+')'); return; }
+  debtAddPayment(kind,id,amt,document.getElementById('dpMethod').value,document.getElementById('dpNote').value.trim());
+  closeModal(); toast(amt>=it.balance-0.001?'Debt cleared 🎉':'Payment saved — balance '+fmt(it.balance-amt)); renderNav(); renderPage();
+}
+function custPayModal(keyEnc){
+  const key=decodeURIComponent(keyEnc);
+  const its=debtItems().filter(i=>debtKey(i)===key && i.balance>0); if(!its.length) return;
+  const bal=sum(its,'balance');
+  openModal(`
+    <h2>Receive payment</h2>
+    <div class="sub">${esc(its[0].customer)} · ${its.length} item${its.length===1?'':'s'} · balance <b>${fmt(bal)}</b></div>
+    <div class="row3">
+      <div class="field"><label>Amount received</label><input type="number" id="cpAmount" value="${bal}" min="0" step="any"></div>
+      <div class="field"><label>Paid by</label><select id="cpMethod">${debtMethodOptions()}</select></div>
+      <div class="field"><label>Note</label><input type="text" id="cpNote" placeholder="optional"></div>
+    </div>
+    <div class="muted" style="font-size:12px;">The payment clears the oldest items first.</div>
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="confirmCustPay('${keyEnc}')">Save payment</button></div>`);
+}
+function confirmCustPay(keyEnc){
+  const key=decodeURIComponent(keyEnc);
+  const its=debtItems().filter(i=>debtKey(i)===key && i.balance>0).sort((a,b)=>(a.date+String(a.ts)).localeCompare(b.date+String(b.ts)));
+  const bal=sum(its,'balance');
+  let amt=Number(document.getElementById('cpAmount').value)||0;
+  if(amt<=0){ toast('Enter the amount received'); return; }
+  if(amt>bal+0.001){ toast('That is more than the total balance ('+fmt(bal)+')'); return; }
+  const method=document.getElementById('cpMethod').value, note=document.getElementById('cpNote').value.trim();
+  const left0=amt;
+  for(const it of its){ if(amt<=0.0001) break; const pay=Math.min(amt,it.balance); debtAddPayment(it.kind,it.id,pay,method,note); amt-=pay; }
+  closeModal(); toast(left0>=bal-0.001?'All cleared 🎉':'Payment saved — balance '+fmt(bal-left0)); renderNav(); renderPage();
+}
+function debtHistoryModal(kind,id){
+  const it=debtItems().find(i=>i.kind===kind && i.id===id); if(!it) return;
+  const pays=it.payments.slice().sort((a,b)=>(a.date+String(a.ts)).localeCompare(b.date+String(b.ts)));
+  openModal(`
+    <h2>${esc(it.customer)}</h2>
+    <div class="sub">${esc(it.desc)} · ${esc(it.category)}${it.phone?' · '+esc(it.phone):''}</div>
+    <div class="cl-row"><span>Recorded</span><b>${esc(it.date)}${it.staff?' by '+esc(it.staff):''}</b></div>
+    <div class="cl-row"><span>Total</span><b>${fmt(it.total)}</b></div>
+    <div class="cl-row"><span>Paid</span><b class="pos">${fmt(it.paid)}</b></div>
+    <div class="cl-row total"><span>Balance</span><b>${fmt(it.balance)}</b></div>
+    ${it.due?`<div class="cl-note muted">Pay-by date: ${esc(it.due)}${it.overdue?' — <b style="color:#B23336">overdue</b>':''}</div>`:''}
+    ${it.writtenOff?`<div class="warn-box">This debt was written off${it.src.writeOffDate?' on '+esc(it.src.writeOffDate):''}.</div>`:''}
+    <div class="card-title" style="margin-top:16px;">Payments</div>
+    ${pays.length?`<table><thead><tr><th>Date</th><th>By</th><th>Via</th><th style="text-align:right;">Amount</th></tr></thead><tbody>${pays.map(p=>`<tr><td>${esc(p.date)}</td><td class="muted">${esc(p.by||'—')}${p.note?' · '+esc(p.note):''}</td><td>${esc(p.method)}</td><td style="text-align:right;" class="amt pos">${fmt(p.amount)}</td></tr>`).join('')}</tbody></table>`:'<div class="muted">No payments yet.</div>'}
+    <div class="modal-actions"><button class="btn btn-block" onclick="closeModal()">Close</button></div>`);
+}
+function addDebtModal(){
+  openModal(`
+    <h2>Record a debt</h2>
+    <div class="sub">For money or things owed that are not a normal sale (cash lent, goods taken, an old balance…). For services sold on credit, use New Sale → Owing.</div>
+    <div class="row"><div class="field"><label>Customer name</label><input type="text" id="adName"></div><div class="field"><label>Phone <span class="lab-hint">(optional)</span></label><input type="tel" id="adPhone"></div></div>
+    <div class="row"><div class="field"><label>Category</label><select id="adCat">${DEBT_CATEGORIES.map(c=>`<option ${c==='Cash lent'?'selected':''}>${c}</option>`).join('')}</select></div><div class="field"><label>Amount owed</label><input type="number" id="adAmount" min="0" step="any"></div></div>
+    <div class="field"><label>What is it for?</label><input type="text" id="adDesc" placeholder="e.g. Borrowed ₦2,000 for transport"></div>
+    <div class="row3"><div class="field"><label>Pay-by date</label><input type="date" id="adDue"></div><div class="field"><label>Paid already</label><input type="number" id="adPaid" min="0" step="any" placeholder="0"></div><div class="field"><label>Paid via</label><select id="adMethod">${debtMethodOptions()}</select></div></div>
+    <div class="field"><label>Note</label><input type="text" id="adNote" placeholder="optional"></div>
+    <div class="muted" style="font-size:12px;">Manual debts are tracked here only. They don't change your sales or profit.</div>
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="confirmAddDebt()">Save debt</button></div>`);
+}
+function confirmAddDebt(){
+  const $=id=>document.getElementById(id);
+  const name=$('adName').value.trim(), amount=Number($('adAmount').value)||0, paid=Number($('adPaid').value)||0;
+  if(!name){ toast("Enter the customer's name"); return; }
+  if(amount<=0){ toast('Enter the amount owed'); return; }
+  if(paid>amount){ toast('Paid already is more than the amount'); return; }
+  const me=currentStaff?currentStaff.name:'';
+  const d={id:uid(), ts:Date.now(), date:todayISO(), customer:name, phone:$('adPhone').value.trim(), category:$('adCat').value, description:$('adDesc').value.trim(), amount, dueDate:$('adDue').value||'', note:$('adNote').value.trim(), staff:me, payments:[]};
+  if(paid>0) d.payments.push({id:uid(), date:todayISO(), amount:paid, method:$('adMethod').value, by:me, ts:Date.now(), note:'Paid when recorded'});
+  debts.push(d); saveData('debts',debts); cloudSet('debts',d);
+  closeModal(); toast('Debt recorded'); renderNav(); renderPage();
+}
+function debtEditModal(kind,id){
+  if(!isAdmin()) return;
+  const it=debtItems().find(i=>i.kind===kind && i.id===id); if(!it) return;
+  openModal(`
+    <h2>Edit debt</h2><div class="sub">${esc(it.customer)} · ${esc(it.desc)}</div>
+    <div class="row"><div class="field"><label>Customer name</label><input type="text" id="edName" value="${esc(it.customer)}"></div><div class="field"><label>Phone</label><input type="tel" id="edPhone" value="${esc(it.phone)}"></div></div>
+    <div class="row"><div class="field"><label>Category</label><select id="edCat">${DEBT_CATEGORIES.map(c=>`<option ${c===it.category?'selected':''}>${c}</option>`).join('')}</select></div><div class="field"><label>Pay-by date</label><input type="date" id="edDue" value="${esc(it.due)}"></div></div>
+    ${kind==='manual'?`<div class="row"><div class="field"><label>What is it for?</label><input type="text" id="edDesc" value="${esc(it.src.description||'')}"></div><div class="field"><label>Amount owed</label><input type="number" id="edAmount" value="${it.total}" step="any"></div></div>`:'<div class="muted" style="font-size:12px;margin-bottom:10px;">To change the amount of a credit sale, edit it in the Sales Log.</div>'}
+    <div class="field"><label>Note</label><input type="text" id="edNote" value="${esc(it.note)}"></div>
+    <div class="modal-actions" style="flex-wrap:wrap;">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      ${it.balance>0?`<button class="btn btn-danger" onclick="debtWriteOff('${kind}','${id}')">Write off ${fmt(it.balance)}</button>`:''}
+      ${it.writtenOff?`<button class="btn" onclick="debtUndoWriteOff('${kind}','${id}')">Undo write-off</button>`:''}
+      ${kind==='manual'?`<button class="btn btn-danger" onclick="debtDelete('${id}')">Delete</button>`:''}
+      <button class="btn btn-cyan btn-block" onclick="confirmDebtEdit('${kind}','${id}')">Save changes</button>
+    </div>`);
+}
+function confirmDebtEdit(kind,id){
+  const src=debtSrc(kind,id); if(!src) return; const $=i=>document.getElementById(i);
+  const name=$('edName').value.trim(); if(!name){ toast('Enter a name'); return; }
+  src.customer=name; src.phone=$('edPhone').value.trim(); src.dueDate=$('edDue').value||''; src.note=$('edNote').value.trim();
+  if(kind==='sale') src.debtCategory=$('edCat').value; else { src.category=$('edCat').value; src.description=$('edDesc').value.trim(); const a=Number($('edAmount').value)||0; if(a>0) src.amount=a; }
+  debtSave(kind,src); closeModal(); toast('Debt updated'); renderNav(); renderPage();
+}
+function debtWriteOff(kind,id){
+  if(!confirm('Write off the remaining balance? It will stop counting as owed and will not be counted as income.')) return;
+  const src=debtSrc(kind,id); if(!src) return; debtEnsurePayments(kind,src);
+  src.writtenOff=true; src.writeOffDate=todayISO(); debtSave(kind,src); closeModal(); toast('Written off'); renderNav(); renderPage();
+}
+function debtUndoWriteOff(kind,id){
+  const src=debtSrc(kind,id); if(!src) return; delete src.writtenOff; delete src.writeOffDate; debtSave(kind,src); closeModal(); toast('Write-off undone'); renderNav(); renderPage();
+}
+function debtDelete(id){
+  if(!confirm('Delete this debt record completely?')) return;
+  debts=debts.filter(d=>d.id!==id); saveData('debts',debts); cloudDelete('debts',id); closeModal(); toast('Debt deleted'); renderNav(); renderPage();
+}
+function remindCustomer(keyEnc){
+  const key=decodeURIComponent(keyEnc);
+  const its=debtItems().filter(i=>debtKey(i)===key && i.balance>0); if(!its.length) return;
+  const bal=sum(its,'balance'), paid=sum(its,'paid'), total=sum(its,'total');
+  const due=its.map(i=>i.due).filter(Boolean).sort()[0];
+  const lines=[`Hello ${its[0].customer},`,`This is a friendly reminder from ${settings.shopName}.`,
+    `You currently owe ${fmt(bal)}${paid>0?` (total ${fmt(total)}, paid so far ${fmt(paid)})`:''} for: ${its.map(i=>i.desc).slice(0,4).join(', ')}${its.length>4?'…':''}.`];
+  if(due) lines.push(`Pay-by date: ${due}.`);
+  lines.push('Kindly settle when you can. Thank you!');
+  const text=lines.join('\n');
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(()=>toast('Reminder copied — paste it into WhatsApp or SMS')).catch(()=>prompt('Copy this reminder:',text));
+  else prompt('Copy this reminder:',text);
+}
+function exportDebtsCSV(){
+  const rows=debtFiltered().map(i=>({date:i.date, customer:i.customer, phone:i.phone, category:i.category, description:i.desc, total:i.total, paid:i.paid, balance:i.balance, payBy:i.due, status:i.overdue?'overdue':i.status, recordedBy:i.staff, note:i.note}));
+  downloadCSV(rows,['date','customer','phone','category','description','total','paid','balance','payBy','status','recordedBy','note'],'highspeed-debts-'+todayISO()+'.csv');
 }
 
 /* ================= DAY CLOSING ================= */
@@ -1138,12 +1452,15 @@ let closeDate = null;
 function closingFigures(date, who){
   const mine = x => x.staff===who;
   const cashSales = sales.filter(x=>x.payment==='cash' && x.date===date && mine(x));
-  const cashDebts = sales.filter(x=>x.payment==='credit' && x.paid && x.paidMethod==='cash' && x.paidDate===date && x.paidBy===who);
+  const cashDebts=[];
+  sales.filter(isCredit).forEach(x=>payListOf(x).forEach(p=>{ if(p.method==='cash' && p.date===date && p.by===who) cashDebts.push(p); }));
+  debts.forEach(d=>(d.payments||[]).forEach(p=>{ if(p.method==='cash' && p.date===date && p.by===who) cashDebts.push(p); }));
+  const lent = debts.filter(d=>d.category==='Cash lent' && d.date===date && d.staff===who);
   const other = sales.filter(x=>(x.payment==='transfer'||x.payment==='pos') && x.date===date && mine(x));
   const owedNew = sales.filter(x=>x.payment==='credit' && x.date===date && mine(x));
   const exps = expenses.filter(e=>e.date===date && e.staff===who);
-  const expected = sum(cashSales,'amount')+sum(cashDebts,'amount')-sum(exps,'amount');
-  return {cashSales,cashDebts,other,owedNew,exps,expected};
+  const expected = sum(cashSales,'amount')+sum(cashDebts,'amount')-sum(exps,'amount')-sum(lent,'amount');
+  return {cashSales,cashDebts,lent,other,owedNew,exps,expected};
 }
 function pageClosing(){
   const admin=isAdmin();
@@ -1159,6 +1476,7 @@ function pageClosing(){
       <div class="cl-row"><span>Cash sales</span><b>${fmt(sum(f.cashSales,'amount'))}</b></div>
       <div class="cl-row"><span>Debts collected in cash</span><b>${fmt(sum(f.cashDebts,'amount'))}</b></div>
       <div class="cl-row neg"><span>Expenses you paid out</span><b>− ${fmt(sum(f.exps,'amount'))}</b></div>
+      ${f.lent.length?`<div class="cl-row neg"><span>Cash lent out (debts)</span><b>− ${fmt(sum(f.lent,'amount'))}</b></div>`:''}
       <div class="cl-row total"><span>Cash that should be in the till</span><b>${fmt(f.expected)}</b></div>
       <div class="cl-note muted">Also made: ${fmt(sum(f.other,'amount'))} by transfer/POS${f.owedNew.length?` · ${fmt(sum(f.owedNew,'amount'))} left owing`:''} (not counted as cash).</div>
     </div>
@@ -1609,7 +1927,7 @@ function pageBackup(){
   `;
 }
 function exportBackup(){
-  const payload = {exportedAt:new Date().toISOString(), settings, sales, expenses, services, stations, inventory, staff, closings, profitShare};
+  const payload = {exportedAt:new Date().toISOString(), settings, sales, expenses, services, stations, inventory, staff, closings, profitShare, debts};
   const blob = new Blob([JSON.stringify(payload,null,2)], {type:'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1634,6 +1952,7 @@ function restoreBackup(){
       inventory = data.inventory || inventory;
       staff = data.staff || staff;
       closings = data.closings || closings;
+      debts = data.debts || debts;
       profitShare = data.profitShare || profitShare;
       persistAll();
       if(cloudMode){
@@ -1644,6 +1963,7 @@ function restoreBackup(){
         inventory.forEach(r=>cloudSet('inventory', r));
         staff.forEach(r=>cloudSet('staff', r));
         closings.forEach(r=>cloudSet('closings', r));
+        debts.forEach(r=>cloudSet('debts', r));
         cloudSetProfitShare();
         cloudSetSettings();
       }
@@ -1860,6 +2180,7 @@ function printReceipt(recs){
     </table>
     <hr>
     <table style="width:100%;font-weight:bold;"><tr><td>TOTAL</td><td style="text-align:right;">${fmt(total)}</td></tr></table>
+    ${f.payment==='credit'?`<table style="width:100%;"><tr><td>Paid now</td><td style="text-align:right;">${fmt(sum(recs.map(r=>({v:paidOf(r)})),'v'))}</td></tr><tr><td><b>Balance owing</b></td><td style="text-align:right;"><b>${fmt(sum(recs.map(r=>({v:outstandingOf(r)})),'v'))}</b></td></tr>${f.dueDate?`<tr><td>Pay by</td><td style="text-align:right;">${esc(f.dueDate)}</td></tr>`:''}</table>`:''}
     <div style="margin-top:4px;">Payment: ${f.payment==='credit'?'OWING (to be paid later)':esc(f.payment.toUpperCase())}</div>
     <hr>
     <div class="c">Thank you for choosing Highspeed!</div>`;
