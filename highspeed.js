@@ -46,6 +46,7 @@ const ICONS = {
   right:'<path d="M9 6l6 6-6 6"/>',
   users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M17 4.5a3.5 3.5 0 0 1 0 7M21.5 20a6.5 6.5 0 0 0-3.5-5.8"/>',
   cart:'<circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M3 4h2.5l2.2 11h10.5L20 7H6.5"/>',
+  bank:'<path d="M3 10l9-6 9 6M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 20h18"/>',
   x:'<path d="M6 6l12 12M18 6L6 18"/>'
 };
 function icon(n,size){ size=size||18; return '<svg class="ico" width="'+size+'" height="'+size+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+(ICONS[n]||'')+'</svg>'; }
@@ -119,6 +120,7 @@ let stations   = loadData("stations", null) || DEFAULT_STATIONS;
 let inventory  = loadData("inventory", null) || DEFAULT_INVENTORY;
 let staff      = loadData("staff", null) || DEFAULT_STAFF;
 let closings   = loadData("closings", []);
+let payables   = loadData("payables", []);   // debts the SHOP owes (suppliers, rent, loans…)
 let debts      = loadData("debts", []);   // manually recorded debts (cash lent, goods, old balances…)
 const DEFAULT_SHARES = () => ([
   {id:uid(), name:"Shop Maintenance Fund", kind:"fund",   pct:20},
@@ -140,6 +142,7 @@ function persistAll(){
   saveData("staff", staff);
   saveData("closings", closings);
   saveData("debts", debts);
+  saveData("payables", payables);
   saveData("profitshare", profitShare);
 }
 persistAll();
@@ -273,6 +276,11 @@ function attachCloudListeners(){
     saveData('closings', closings);
     safeRerender();
   }));
+  CLOUD_LISTENERS.push(fsCol('payables').onSnapshot(snap=>{
+    payables = snap.docs.map(d=>d.data());
+    saveData('payables', payables);
+    safeRerender();
+  }));
   CLOUD_LISTENERS.push(fsCol('debts').onSnapshot(snap=>{
     debts = snap.docs.map(d=>d.data());
     saveData('debts', debts);
@@ -345,6 +353,7 @@ const NAV = [
     {id:"stations", label:"Computer Stations", ic:"monitor"},
     {id:"sales", label:"Sales Log", ic:"list"},
     {id:"debts", label:"Customer Debts", ic:"clock"},
+    {id:"payables", label:"Debts We Owe", ic:"bank", admin:true},
     {id:"expenses", label:"Expenses", ic:"wallet"},
     {id:"closing", label:"Day Closing", ic:"check"},
   ]},
@@ -375,6 +384,7 @@ function renderNav(){
     ${items.map(it=>{
       let badge='';
       if(it.id==='inventory' && lowStockCount()>0) badge=`<span class="badge">${lowStockCount()}</span>`;
+      if(it.id==='payables'){ const od=plOverdue(); if(od.length>0) badge=`<span class="badge">${od.length}</span>`; }
       if(it.id==='debts'){ const od=openDebts(); if(od.length>0) badge=`<span class="badge">${od.length}</span>`; }
       return `
       <button class="navitem ${currentPage===it.id?'active':''}" onclick="go('${it.id}')">
@@ -409,6 +419,7 @@ const PAGE_META = {
   backup:["Backup & Restore","Protect your data — this shop runs offline"],
   settings:["Settings","Shop details and preferences"],
   debts:["Customer Debts","Who owes the shop money"],
+  payables:["Debts We Owe","Money the shop owes suppliers, landlords and others"],
   closing:["Day Closing","Count the till at the end of your shift"],
   profit:["Profit Share","Private weekly profit sharing (Monday to Sunday)"]
 };
@@ -432,7 +443,7 @@ function toggleSidebar(){ document.getElementById('sidebar').classList.toggle('o
 
 function renderPage(){
   const c = document.getElementById('content');
-  const pages = {dashboard:pageDashboard, pos:pagePOS, stations:pageStations, sales:pageSales, debts:pageDebts,
+  const pages = {dashboard:pageDashboard, pos:pagePOS, stations:pageStations, sales:pageSales, debts:pageDebts, payables:pagePayables,
     expenses:pageExpenses, closing:pageClosing, services:pageServices, inventory:pageInventory,
     reports:pageReports, profit:pageProfit, backup:pageBackup, settings:pageSettings};
   const fn = pages[currentPage] || pageDashboard;
@@ -441,6 +452,7 @@ function renderPage(){
   if(currentPage==='reports') initReports();
   if(currentPage==='sales') filterSalesLog();
   if(currentPage==='debts') debtBind();
+  if(currentPage==='payables') plRenderList();
   if(currentPage==='closing'){ const f=closingFigures(isAdmin()?(closeDate||todayISO()):todayISO(), currentStaff?currentStaff.name:''); initClosingLive(f.expected); }
   if(currentPage==='stations') renderStationGrid();
   if(currentPage==='settings'){ renderStaffList(); renderCloudPanel(); }
@@ -589,6 +601,7 @@ function pageDashboard(){
     <div class="btn-row"><button class="btn btn-cyan" onclick="go('pos')">${icon('plus',16)} New sale</button><button class="btn" onclick="copyDailySummary()">${icon('copy',16)} Copy daily summary</button></div>
   </div>
 
+  ${payablesAlert()}
   <div class="grid grid-4">
     ${statCard('accent-cyan','trend',"Today's Revenue",fmt(revenue),`${todaySales.length} payment${todaySales.length===1?'':'s'} received`)}
     ${statCard('accent-red','wallet',"Today's Expenses",fmt(exp),`${todayExp.length} entr${todayExp.length===1?'y':'ies'}`)}
@@ -1767,6 +1780,248 @@ function runReport(){
   }
 }
 
+/* ================= DEBTS WE OWE (payables — admin only) ================= */
+const PAYABLE_CATS = ['Supplier / stock purchase','Equipment','Rent','Electricity / generator fuel','Internet / data','Staff wages','Loan / borrowed money','Repairs & maintenance','Other'];
+/* which Expenses category a payment is counted under (null = not an expense, e.g. loan repayment) */
+const PAYABLE_TO_EXPENSE = {'Supplier / stock purchase':'Stationery / Consumables','Equipment':'Maintenance & Repairs','Rent':'Rent','Electricity / generator fuel':'Electricity / Generator Fuel','Internet / data':'Internet Subscription (Data/Router)','Staff wages':'Staff Wages','Loan / borrowed money':null,'Repairs & maintenance':'Maintenance & Repairs','Other':'Other'};
+let plState = {q:'', status:'open', cat:''};
+
+function plPaid(p){ return psNum(sum(p.payments||[],'amount')); }
+function plBalance(p){ return Math.max(0, psNum(Number(p.amount)-plPaid(p))); }
+function plStatus(p){
+  if(plBalance(p)<=0) return 'paid';
+  if(p.dueDate && p.dueDate<todayISO()) return 'overdue';
+  return plPaid(p)>0 ? 'part' : 'unpaid';
+}
+function plOverdue(){ return payables.filter(p=>plStatus(p)==='overdue'); }
+function plStatusTag(st){
+  const m={paid:['tag-paidlater','Fully paid'],overdue:['tag-overdue','Overdue'],part:['tag-part','Part paid'],unpaid:['tag-credit','Not paid']};
+  return `<span class="tag ${m[st][0]}">${m[st][1]}</span>`;
+}
+function plDueText(p){
+  if(plBalance(p)<=0) return '';
+  if(!p.dueDate) return 'No due date';
+  const d=Math.round((parseISO(p.dueDate)-parseISO(todayISO()))/86400000);
+  if(d<0) return `${-d} day${d===-1?'':'s'} overdue`;
+  if(d===0) return 'due today';
+  return `due in ${d} day${d===1?'':'s'}`;
+}
+function payablesAlert(){
+  if(!isAdmin()) return '';
+  const od=plOverdue(); if(!od.length) return '';
+  return `<div class="alert-bar" onclick="go('payables')"><span class="ab-ic">${icon('clock',18)}</span><div><b>${od.length} overdue debt${od.length===1?'':'s'}</b> — you owe ${fmt(sum(od.map(p=>({v:plBalance(p)})),'v'))} past the due date.</div><span class="ab-go">Review ${icon('right',14)}</span></div>`;
+}
+
+function pagePayables(){
+  if(!isAdmin()) return '<div class="card">This page is for admins only.</div>';
+  const t=todayISO(), week=addDays(t,7);
+  const owed=psNum(sum(payables.map(p=>({v:plBalance(p)})),'v'));
+  const paidAll=psNum(sum(payables.map(p=>({v:plPaid(p)})),'v'));
+  const od=plOverdue();
+  const odAmt=psNum(sum(od.map(p=>({v:plBalance(p)})),'v'));
+  const dueSoon=payables.filter(p=>plBalance(p)>0 && p.dueDate && p.dueDate>=t && p.dueDate<=week);
+  const dueSoonAmt=psNum(sum(dueSoon.map(p=>({v:plBalance(p)})),'v'));
+  const byCat={}; payables.forEach(p=>{ const b=plBalance(p); if(b>0) byCat[p.category]=(byCat[p.category]||0)+b; });
+  const cats=Object.entries(byCat).sort((a,b)=>b[1]-a[1]); const catMax=Math.max(1,...cats.map(c=>c[1]));
+  return `
+  <div class="hello" style="margin-bottom:16px;">
+    <div><div class="hello-t">Debts we owe</div><div class="hello-s">Suppliers, rent, loans — everything the shop still has to pay</div></div>
+    <div class="btn-row"><button class="btn btn-cyan" onclick="plAddModal()">${icon('plus',16)} Record a debt</button><button class="btn" onclick="plCopy()">${icon('copy',16)} Copy summary</button><button class="btn" onclick="plExport()">Export CSV</button></div>
+  </div>
+  <div class="grid grid-4">
+    ${statCard('accent-red','bank','Total we still owe',fmt(owed),`${payables.filter(p=>plBalance(p)>0).length} open debt${payables.filter(p=>plBalance(p)>0).length===1?'':'s'}`,'color:#B23336')}
+    ${statCard('accent-green','check','Paid so far',fmt(paidAll),`Out of ${fmt(psNum(sum(payables,'amount')))} borrowed or billed`)}
+    ${statCard('accent-amber','clock','Overdue',fmt(odAmt),`${od.length} debt${od.length===1?'':'s'} past due date`,od.length?'color:#B23336':'')}
+    ${statCard('accent-cyan','trend','Due in 7 days',fmt(dueSoonAmt),`${dueSoon.length} debt${dueSoon.length===1?'':'s'} coming up`)}
+  </div>
+  ${cats.length?`<div class="section-title">Where the debt is <span class="hint">Still owed, by category</span></div><div class="card">${cats.map(([n,a])=>`<div class="barwrap"><div class="barlabel" style="width:190px;">${esc(n)}</div><div class="bartrack"><div class="barfill" style="width:${a/catMax*100}%;background:linear-gradient(90deg,var(--red-500),#F59A9C);"></div></div><div class="barval" style="width:110px;">${fmt(psNum(a))}</div></div>`).join('')}</div>`:''}
+  <div class="section-title">All debts</div>
+  <div class="card filters">
+    <div class="field grow"><label>Search</label><input type="text" id="plQ" value="${esc(plState.q)}" placeholder="who, what for, category, note…" oninput="plState.q=this.value;plRenderList()"></div>
+    <div class="field"><label>Show</label><select onchange="plState.status=this.value;plRenderList()">
+      ${[['open','Still owing'],['overdue','Overdue only'],['paid','Fully paid'],['all','Everything']].map(([v,l])=>`<option value="${v}" ${plState.status===v?'selected':''}>${l}</option>`).join('')}</select></div>
+    <div class="field"><label>Category</label><select onchange="plState.cat=this.value;plRenderList()"><option value="">All categories</option>${PAYABLE_CATS.map(c=>`<option ${plState.cat===c?'selected':''}>${esc(c)}</option>`).join('')}</select></div>
+  </div>
+  <div id="plList"></div>`;
+}
+function plFiltered(){
+  const q=plState.q.trim().toLowerCase();
+  const rank=st=> st==='overdue'?0 : (st==='paid'?2:1);
+  return payables.filter(p=>{
+    const st=plStatus(p);
+    if(plState.status==='open' && st==='paid') return false;
+    if(plState.status==='overdue' && st!=='overdue') return false;
+    if(plState.status==='paid' && st!=='paid') return false;
+    if(plState.cat && p.category!==plState.cat) return false;
+    if(q && ![p.creditor,p.description,p.category,p.note,p.phone].join(' ').toLowerCase().includes(q)) return false;
+    return true;
+  }).sort((a,b)=> rank(plStatus(a))-rank(plStatus(b)) || (a.dueDate||'9999').localeCompare(b.dueDate||'9999') || (b.date||'').localeCompare(a.date||''));
+}
+function plRenderList(){
+  const el=document.getElementById('plList'); if(!el) return;
+  const list=plFiltered();
+  if(!list.length){ el.innerHTML=`<div class="card empty-card">${payables.length?'No debts match this filter.':'No debts recorded yet. Tap “Record a debt” when the shop owes someone.'}</div>`; return; }
+  el.innerHTML = list.map(p=>{
+    const st=plStatus(p), paid=plPaid(p), bal=plBalance(p), pct=Math.min(100,Math.round(paid/Number(p.amount)*100));
+    const pays=(p.payments||[]).slice().sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+    return `
+    <div class="card pay-card ${st}">
+      <div class="pc-head">
+        <div class="pc-title"><b>${esc(p.creditor)}</b> <span class="tag tag-cat">${esc(p.category)}</span> ${plStatusTag(st)}</div>
+        <div class="pc-bal"><small>${bal>0?'Balance left':'Cleared'}</small><span class="${bal>0?'owing':'pos'}">${fmt(bal)}</span></div>
+      </div>
+      <div class="muted pc-desc">${esc(p.description||'No description')}${p.phone?' · '+esc(p.phone):''}</div>
+      <div class="prog"><div class="prog-fill ${st}" style="width:${pct}%"></div></div>
+      <div class="pc-nums">
+        <span>Total <b>${fmt(p.amount)}</b></span><span>Paid <b class="pos">${fmt(paid)}</b> <em>(${pct}%)</em></span><span>Left <b class="owing">${fmt(bal)}</b></span>
+        <span>Since <b>${esc(fmtDay(p.date))}</b></span>
+        <span>Due <b>${p.dueDate?esc(fmtDay(p.dueDate)):'—'}</b> ${bal>0?`<em class="${st==='overdue'?'bad':''}">${plDueText(p)}</em>`:''}</span>
+      </div>
+      ${p.note?`<div class="pc-note">${icon('edit',13)} ${esc(p.note)}</div>`:''}
+      ${pays.length?`<div class="pay-hist"><div class="ph-title">Payments made</div>${pays.map(x=>`<div class="ph-row"><span>${esc(fmtDay(x.date))}</span><span class="ph-amt">${fmt(x.amount)}</span><span class="muted">${esc(x.method||'')}${x.note?' · '+esc(x.note):''}${x.by?' · by '+esc(x.by):''}${x.counted?' · <em>counted as expense</em>':''}</span><button class="icon-btn danger" title="Delete this payment" onclick="plDelPay('${p.id}','${x.id}')">${icon('trash',14)}</button></div>`).join('')}</div>`:''}
+      <div class="btn-row pc-actions">
+        ${bal>0?`<button class="btn btn-cyan btn-sm" onclick="plPayModal('${p.id}')">${icon('plus',14)} Add payment</button>`:''}
+        <button class="btn btn-sm" onclick="plEditModal('${p.id}')">${icon('edit',14)} Edit</button>
+        <button class="btn btn-sm btn-danger" onclick="plDelete('${p.id}')">${icon('trash',14)} Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function plCatOptions(sel){ return PAYABLE_CATS.map(c=>`<option ${c===sel?'selected':''}>${esc(c)}</option>`).join(''); }
+function plExpenseBox(cat){
+  const counts = PAYABLE_TO_EXPENSE[cat]!==null && PAYABLE_TO_EXPENSE[cat]!==undefined;
+  return `<label class="chk"><input type="checkbox" id="plAsExp" ${counts?'checked':'disabled'}> Count payments as a shop expense (reduces profit)</label>
+          <div class="muted" style="font-size:11.5px;margin:-6px 0 12px 26px;" id="plExpHint">${counts?'Tick this when the money is a running cost (rent, fuel, supplies). It adds a line to Expenses.':'Loan repayments are not counted as expenses.'}</div>`;
+}
+function plCatChange(){
+  const cat=document.getElementById('plCategory').value, box=document.getElementById('plAsExp'), hint=document.getElementById('plExpHint');
+  const counts=PAYABLE_TO_EXPENSE[cat]!==null;
+  box.disabled=!counts; box.checked=counts;
+  hint.textContent = counts ? 'Tick this when the money is a running cost (rent, fuel, supplies). It adds a line to Expenses.' : 'Loan repayments are not counted as expenses.';
+}
+function plAddModal(){
+  openModal(`
+    <h2>Record a debt</h2><div class="sub">Something the shop owes to someone</div>
+    <div class="field"><label>Who is owed? <span class="lab-hint">(supplier, landlord, person…)</span></label><input type="text" id="plCreditor" placeholder="e.g. Alhaji Musa — paper supplier"></div>
+    <div class="row"><div class="field"><label>Category</label><select id="plCategory" onchange="plCatChange()">${plCatOptions('Supplier / stock purchase')}</select></div>
+    <div class="field"><label>Phone (optional)</label><input type="text" id="plPhone" placeholder="080…"></div></div>
+    <div class="field"><label>What is it for?</label><input type="text" id="plDesc" placeholder="e.g. 20 reams of A4 paper"></div>
+    <div class="row"><div class="field"><label>Total amount owed</label><input type="number" id="plAmount" step="any" min="0" placeholder="0"></div>
+    <div class="field"><label>Already paid (optional)</label><input type="number" id="plPaidNow" step="any" min="0" placeholder="0"></div></div>
+    <div class="row"><div class="field"><label>Date it started</label><input type="date" id="plDate" value="${todayISO()}"></div>
+    <div class="field"><label>Pay-by date (optional)</label><input type="date" id="plDue"></div></div>
+    <div class="field"><label>Paid how?</label><select id="plMethod"><option value="cash">Cash</option><option value="transfer">Transfer</option><option value="pos">POS</option></select></div>
+    ${plExpenseBox('Supplier / stock purchase')}
+    <div class="field"><label>Note (optional)</label><input type="text" id="plNote" placeholder="Agreement, promise, anything to remember"></div>
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="plSaveNew()">Save debt</button></div>`);
+}
+function plRecordExpense(p,pay){
+  const cat=PAYABLE_TO_EXPENSE[p.category];
+  if(cat===null || cat===undefined) return false;
+  const e={id:uid(), date:pay.date, category:cat, amount:pay.amount, description:'Debt payment — '+p.creditor, staff:currentStaff?currentStaff.name:'', payRef:pay.id};
+  expenses.push(e); saveData('expenses',expenses); cloudSet('expenses',e); return true;
+}
+function plRemoveExpenseFor(payId){
+  expenses.filter(e=>e.payRef===payId).forEach(e=>cloudDelete('expenses',e.id));
+  expenses=expenses.filter(e=>e.payRef!==payId); saveData('expenses',expenses);
+}
+function plSaveNew(){
+  const $=i=>document.getElementById(i);
+  const creditor=$('plCreditor').value.trim(), amount=Number($('plAmount').value)||0, paidNow=Number($('plPaidNow').value)||0;
+  if(!creditor){ toast('Enter who the shop owes'); return; }
+  if(amount<=0){ toast('Enter the total amount owed'); return; }
+  if(paidNow<0 || paidNow>amount){ toast('Amount already paid cannot be more than the total'); return; }
+  const by=currentStaff?currentStaff.name:'';
+  const p={id:uid(), ts:Date.now(), creditor, phone:$('plPhone').value.trim(), category:$('plCategory').value, description:$('plDesc').value.trim(),
+    amount, date:$('plDate').value||todayISO(), dueDate:$('plDue').value||'', note:$('plNote').value.trim(), payments:[], createdBy:by};
+  if(paidNow>0){
+    const pay={id:uid(), date:p.date, amount:paidNow, method:$('plMethod').value, note:'Paid when recorded', by, counted:false};
+    if($('plAsExp') && $('plAsExp').checked && plRecordExpense(p,pay)) pay.counted=true;
+    p.payments.push(pay);
+  }
+  payables.push(p); saveData('payables',payables); cloudSet('payables',p);
+  closeModal(); toast('Debt recorded'); renderNav(); renderPage();
+}
+function plPayModal(id){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  const bal=plBalance(p);
+  openModal(`
+    <h2>Add a payment</h2><div class="sub">${esc(p.creditor)} · ${esc(p.category)} · <b>${fmt(bal)}</b> still owed</div>
+    <div class="field"><label>Amount paid now</label><input type="number" id="ppAmount" step="any" min="0" value="${bal}"></div>
+    <div class="row"><div class="field"><label>Date</label><input type="date" id="ppDate" value="${todayISO()}"></div>
+    <div class="field"><label>Paid how?</label><select id="ppMethod"><option value="cash">Cash</option><option value="transfer">Transfer</option><option value="pos">POS</option></select></div></div>
+    <div class="field"><label>Note (optional)</label><input type="text" id="ppNote" placeholder="e.g. second instalment"></div>
+    ${plExpenseBox(p.category)}
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="plSavePay('${id}')">Save payment</button></div>`);
+}
+function plSavePay(id){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  const $=i=>document.getElementById(i);
+  const amount=Number($('ppAmount').value)||0, bal=plBalance(p);
+  if(amount<=0){ toast('Enter the amount paid'); return; }
+  if(amount>bal+0.005){ toast('That is more than the balance left ('+fmt(bal)+')'); return; }
+  const pay={id:uid(), date:$('ppDate').value||todayISO(), amount, method:$('ppMethod').value, note:$('ppNote').value.trim(), by:currentStaff?currentStaff.name:'', counted:false};
+  if($('plAsExp') && $('plAsExp').checked && plRecordExpense(p,pay)) pay.counted=true;
+  p.payments=(p.payments||[]).concat([pay]);
+  saveData('payables',payables); cloudSet('payables',p);
+  closeModal(); toast(plBalance(p)<=0?'Debt fully paid 🎉':'Payment saved'); renderNav(); renderPage();
+}
+function plDelPay(id,payId){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  if(!confirm('Delete this payment? Any expense it created is removed too.')) return;
+  p.payments=(p.payments||[]).filter(x=>x.id!==payId);
+  plRemoveExpenseFor(payId);
+  saveData('payables',payables); cloudSet('payables',p);
+  toast('Payment deleted'); renderNav(); renderPage();
+}
+function plEditModal(id){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  openModal(`
+    <h2>Edit debt</h2><div class="sub">Already paid: ${fmt(plPaid(p))}</div>
+    <div class="field"><label>Who is owed?</label><input type="text" id="peCreditor" value="${esc(p.creditor)}"></div>
+    <div class="row"><div class="field"><label>Category</label><select id="peCategory">${plCatOptions(p.category)}</select></div>
+    <div class="field"><label>Phone</label><input type="text" id="pePhone" value="${esc(p.phone||'')}"></div></div>
+    <div class="field"><label>What is it for?</label><input type="text" id="peDesc" value="${esc(p.description||'')}"></div>
+    <div class="row"><div class="field"><label>Total amount owed</label><input type="number" id="peAmount" step="any" value="${esc(p.amount)}"></div>
+    <div class="field"><label>Date it started</label><input type="date" id="peDate" value="${esc(p.date)}"></div></div>
+    <div class="field"><label>Pay-by date</label><input type="date" id="peDue" value="${esc(p.dueDate||'')}"></div>
+    <div class="field"><label>Note</label><input type="text" id="peNote" value="${esc(p.note||'')}"></div>
+    <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-cyan btn-block" onclick="plSaveEdit('${id}')">Save changes</button></div>`);
+}
+function plSaveEdit(id){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  const $=i=>document.getElementById(i);
+  const creditor=$('peCreditor').value.trim(), amount=Number($('peAmount').value)||0;
+  if(!creditor){ toast('Enter who the shop owes'); return; }
+  if(amount<plPaid(p)){ toast('Total cannot be less than the '+fmt(plPaid(p))+' already paid'); return; }
+  p.creditor=creditor; p.category=$('peCategory').value; p.phone=$('pePhone').value.trim(); p.description=$('peDesc').value.trim();
+  p.amount=amount; p.date=$('peDate').value||p.date; p.dueDate=$('peDue').value||''; p.note=$('peNote').value.trim();
+  saveData('payables',payables); cloudSet('payables',p);
+  closeModal(); toast('Debt updated'); renderNav(); renderPage();
+}
+function plDelete(id){
+  const p=payables.find(x=>x.id===id); if(!p) return;
+  if(!confirm(`Delete the debt to ${p.creditor}? This also removes the expenses created from its payments.`)) return;
+  (p.payments||[]).forEach(x=>plRemoveExpenseFor(x.id));
+  payables=payables.filter(x=>x.id!==id); saveData('payables',payables); cloudDelete('payables',id);
+  toast('Debt deleted'); renderNav(); renderPage();
+}
+function plCopy(){
+  const open=payables.filter(p=>plBalance(p)>0).sort((a,b)=>(a.dueDate||'9999').localeCompare(b.dueDate||'9999'));
+  const lines=[`*${settings.shopName}* — debts we owe`, new Date().toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'}), ''];
+  if(!open.length) lines.push('No outstanding debts.');
+  open.forEach(p=>lines.push(`• ${p.creditor} (${p.category}): ${fmt(plBalance(p))} left of ${fmt(p.amount)}${p.dueDate?` — due ${fmtDay(p.dueDate)}`:''}${plStatus(p)==='overdue'?' ⚠ OVERDUE':''}`));
+  lines.push('', `Total still owed: ${fmt(psNum(sum(open.map(p=>({v:plBalance(p)})),'v')))}`);
+  const text=lines.join('\n');
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(()=>toast('Summary copied')).catch(()=>prompt('Copy:',text));
+  else prompt('Copy:',text);
+}
+function plExport(){
+  const rows=payables.map(p=>({creditor:p.creditor, category:p.category, description:p.description, phone:p.phone, total:p.amount, paid:plPaid(p), balance:plBalance(p), started:p.date, due:p.dueDate, status:plStatus(p), note:p.note}));
+  downloadCSV(rows,['creditor','category','description','phone','total','paid','balance','started','due','status','note'],'highspeed-debts-we-owe-'+todayISO()+'.csv');
+}
+
 /* ================= PROFIT SHARE (admin only, weeks run Monday–Sunday) ================= */
 let psWeek = null;
 function psNum(n){ return Math.round(n*100)/100; }
@@ -1927,7 +2182,7 @@ function pageBackup(){
   `;
 }
 function exportBackup(){
-  const payload = {exportedAt:new Date().toISOString(), settings, sales, expenses, services, stations, inventory, staff, closings, profitShare, debts};
+  const payload = {exportedAt:new Date().toISOString(), settings, sales, expenses, services, stations, inventory, staff, closings, profitShare, debts, payables};
   const blob = new Blob([JSON.stringify(payload,null,2)], {type:'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1952,6 +2207,7 @@ function restoreBackup(){
       inventory = data.inventory || inventory;
       staff = data.staff || staff;
       closings = data.closings || closings;
+      payables = data.payables || payables;
       debts = data.debts || debts;
       profitShare = data.profitShare || profitShare;
       persistAll();
@@ -1963,6 +2219,7 @@ function restoreBackup(){
         inventory.forEach(r=>cloudSet('inventory', r));
         staff.forEach(r=>cloudSet('staff', r));
         closings.forEach(r=>cloudSet('closings', r));
+        payables.forEach(r=>cloudSet('payables', r));
         debts.forEach(r=>cloudSet('debts', r));
         cloudSetProfitShare();
         cloudSetSettings();
