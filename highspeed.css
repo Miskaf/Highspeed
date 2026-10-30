@@ -500,3 +500,26 @@ tbody tr:hover{background:#F8FAFC;}
   .hello{padding:16px;}
 }
 @media print{ body{background:#fff !important;} }
+
+/* ---- debts ledger ---- */
+.credit-box{border:1px dashed #F2CF86;background:#FFFBF0;border-radius:12px;padding:12px 14px 2px;margin-bottom:14px;}
+.cb-title{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.6px;color:#8A5E00;margin-bottom:10px;display:flex;gap:6px;align-items:center;}
+.tag-overdue{background:var(--red-050);color:#B23336;}
+.tag-part{background:var(--cyan-050);color:#0E8A96;}
+.tag-wo{background:#ECEFF3;color:#5B6676;}
+.tag-cat{background:#EEF2F7;color:#4C5A6C;font-weight:600;}
+.debt-card.is-overdue{border-left:4px solid var(--red-500);}
+.debt-head{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px;}
+.dh-main{flex:1;min-width:180px;}
+.dh-phone{margin-left:8px;font-size:12.5px;font-weight:600;color:#0E8A96;text-decoration:none;}
+.dh-fig{text-align:right;min-width:84px;}
+.dh-fig small{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-400);font-weight:700;}
+.dh-fig b{font-family:var(--mono);font-size:16px;}
+.dh-fig b.pos{color:#1B8A5A;}
+.dh-fig b.owing{color:#8A5E00;}
+.dbar{height:6px;background:var(--bg);border-radius:6px;overflow:hidden;margin-bottom:10px;}
+.dbar-fill{height:100%;background:linear-gradient(90deg,var(--green-500),#7BE0B3);border-radius:6px;transition:width .5s ease;}
+.debt-table td{vertical-align:top;}
+.debt-table tr.row-over td{background:#FFF8F8;}
+.debt-table td.actions .btn{margin-right:4px;}
+@media(max-width:640px){ .dh-fig{text-align:left;} .debt-head{gap:10px;} }
